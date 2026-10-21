@@ -1,4 +1,5 @@
-import { Router } from "express";
+import express, { Router } from "express";
+import path from "path";
 import {
     service__get_cdrs,
     service__get_location_status,
@@ -21,6 +22,8 @@ router.get("/", (req, res) => {
 router.get("/v", (req, res) => {
     res.send(`${package_json.version} --${process.env.mode === "qa" ? "QA" : "PROD"}`);
 });
+
+router.use("/docs", express.static(path.resolve(__dirname, "../../docs")));
 
 router.get("/locations/status", service__get_location_status);
 

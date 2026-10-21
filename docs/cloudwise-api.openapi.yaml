@@ -1,0 +1,1034 @@
+openapi: 3.0.3
+info:
+  title: Cloudwise API — as consumed by nx-charge
+  version: "1.1.28"
+  description: |
+    Contract of every outbound call the `nx-charge` service makes to Cloudwise (EV charging / OCPI aggregator),
+    derived from the nx-charge source code (`src/charge/cloudwise_api`) at version 1.1.28.
+    It documents exactly what nx-charge sends and which response fields it relies on.
+
+    ## Conventions shared by every Cloudwise endpoint
+    - **Method**: always `POST`, JSON body, `Content-Type: application/json`.
+    - **Authentication**: no header. Every request body carries `FirebaseToken` — the Firebase ID token
+      obtained from the `signInWithPassword` call (tag *Auth*). The token is refreshed every hour.
+    - **Errors**: Cloudwise reports business errors inside an HTTP 200 body. nx-charge treats any response with
+      `ErrorCode > 0` as a failure (the whole body becomes the error message). Transport errors / non-2xx are failures too.
+    - **Field casing is inconsistent between endpoints** (`Skip` vs `skip`, `BleId` vs `deviceId`, `lon` vs `Longitude`).
+      The names below are exactly what nx-charge sends today; do not normalize them.
+    - **Client timeout**: 30 s, except `sendCommand` with `START_SESSION` (180 s).
+    - **Identity of the charging account**: `AssetId`, `BleId` and `DeviceId` are fixed values of the single
+      Akeyless account at Cloudwise, read from Firestore `nx-settings/cloudwise` (`asset_id`, `ble_id`, `device_id`).
+      They are the same for every car; the car itself is never sent to Cloudwise.
+
+    ## Configuration (Firestore `nx-settings/cloudwise`)
+    | key | used for |
+    |---|---|
+    | `base_url` | server URL of every Cloudwise endpoint (`{base_url}/{endpoint}`) |
+    | `login_key` | Firebase Web API key for `signInWithPassword` |
+    | `email`, `password` | Cloudwise account credentials |
+    | `asset_id`, `ble_id`, `device_id` | account identity sent in session / CDR calls |
+
+    ## Business flows
+    1. **Auth** — on boot and every 60 min: `signInWithPassword` → `idToken` → used as `FirebaseToken`.
+    2. **Location catalog sync** — every 3 min: `getLocations` → full catalog stored in Firestore `nx-charge-locations`.
+    3. **Start session** (car plugged in, detected from CAN bus, or `POST /start_session` API):
+       `getLocationDetails` for candidate locations (live EVSE status) → pick the EVSE in status `BLOCKED`/`PREPARING`
+       → `sendCommand` `START_SESSION` → returned `CommandId` is the session id.
+    4. **Monitor active session** — every 30 s while active: `getCommandStatus` → kWh / cost / time.
+       Session ends when `CommandStatus` is no longer `ACTIVE`, or when the car's credit balance runs out.
+    5. **Stop session** — `sendCommand` `STOP_SESSION` with the session id as `commandId`;
+       20 s later `getCommandStatus` once more to collect the final cost and the `Cdr`, if present.
+    6. **CDR reconciliation** — every 5 min: `getUserCdrs` → matched to finished sessions by `SessionId`
+       (= the `CommandId` from step 3) → the car is billed by the CDR's `TotalCost`.
+servers:
+  - url: "{base_url}"
+    description: Cloudwise API. Value comes from Firestore `nx-settings/cloudwise.base_url`.
+    variables:
+      base_url:
+        default: https://CLOUDWISE_BASE_URL
+        description: Cloudwise base URL (`nx-settings/cloudwise.base_url`).
+tags:
+  - name: Auth
+    description: Obtaining the `FirebaseToken` sent in every Cloudwise request.
+  - name: Locations
+    description: Charging locations, EVSEs (stations), connectors and tariffs.
+  - name: Sessions
+    description: Starting / stopping a charging session and polling its progress.
+  - name: CDRs
+    description: Charge Detail Records — the final billable record of a session.
+
+paths:
+  /v1/accounts:signInWithPassword:
+    servers:
+      - url: https://identitytoolkit.googleapis.com
+        description: Google Identity Toolkit (Firebase Auth) — Cloudwise's identity provider.
+    post:
+      tags: [Auth]
+      operationId: signInWithPassword
+      summary: Log in to Cloudwise and obtain the FirebaseToken
+      description: |
+        Standard Firebase Auth REST login against Cloudwise's Firebase project.
+        nx-charge keeps only `idToken` and sends it as `FirebaseToken` in every Cloudwise request.
+
+        **Called by nx-charge**: on service boot (boot fails if login fails) and every 60 minutes.
+        The ID token lives 3600 s, so the refresh interval equals the token lifetime.
+      parameters:
+        - name: key
+          in: query
+          required: true
+          description: Firebase Web API key of Cloudwise's project (`nx-settings/cloudwise.login_key`).
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SignInRequest"
+            example:
+              email: account@example.com
+              password: "********"
+              returnSecureToken: true
+      responses:
+        "200":
+          description: Logged in.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SignInResponse"
+        "400":
+          description: Wrong credentials or key (Firebase error body). nx-charge logs and throws.
+
+  /getLocations:
+    post:
+      tags: [Locations]
+      operationId: getLocations
+      summary: List all charging locations (catalog)
+      description: |
+        Returns locations with their EVSEs and connectors (OCPI shape, **without tariffs**).
+
+        **Called by nx-charge**: on boot and every 3 minutes (`task__collect_charge_locations`), and on demand from
+        `GET /fetch_all_locations`. Always with the fixed values shown in the example
+        (`lat`/`lon` 0, `radius` 10000, `Skip` 0, `PageSize` 99999999, `TimeZone` 0); the result is used as the full
+        location catalog and filtered locally (Israel bounding box, connector standards, party `EDG` excluded).
+
+        **Response fields used**: `Items[]` → `Id`, `Name`, `Address`, `Country`, `Latitude`, `Longitude`, `Images`,
+        `PartyId`, `CompanyName`, `OcpiEvses[]` (`Uid`, `EvseId`, `Status`, `FloorLevel`, `PhysicalReference`,
+        `LastUpdated`, `OcpiConnectors[]`). The stored location id is `{Id}-{PartyId}-{Country}`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GetLocationsRequest"
+            example:
+              FirebaseToken: eyJhbGciOiJSUzI1NiIs...
+              lat: 0
+              lon: 0
+              radius: 10000
+              Skip: 0
+              PageSize: 99999999
+              TimeZone: 0
+      responses:
+        "200":
+          description: Success when `ErrorCode` is 0; failure when `ErrorCode > 0`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GetLocationsResponse"
+
+  /getLocationDetails:
+    post:
+      tags: [Locations]
+      operationId: getLocationDetails
+      summary: Live details of one location (EVSE status + tariffs)
+      description: |
+        Returns one location with its EVSEs, connectors and **tariff details**, with the live EVSE status.
+
+        **Called by nx-charge**:
+        - Auto start (car plugged in): once per catalog location within `radius_in_meters` of the car
+          (the radius grows by 50 m per retry, up to 5 retries). An EVSE in `BLOCKED` or `PREPARING` is a start candidate;
+          the one whose `LastUpdated` is closest to the plug-in time wins, preferring a non-`CHADEMO` connector.
+        - API start (`POST /start_session`): validates that the requested EVSE / connector exist and that the EVSE is
+          `BLOCKED` or `PREPARING` (3 retries).
+        - `GET /location_status` and `GET /location_details/{id}`: show live status and price to the app.
+
+        **Response fields used**: `Location.Location` (`Id`, `Name`, `Address`, `Country`, `Latitude`, `Longitude`,
+        `Images`, `OperatorName`, `OwnerPartyId`), `Location.Evses[]` (`Uid`, `EvseId`, `Status`, `FloorLevel`,
+        `PhysicalReference`, `LastUpdated`, `Connectors[]` incl. `PricePerKwh`, `ConnectionFee`, `ParkingFee`, `TariffDetails`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GetLocationDetailsRequest"
+            example:
+              FirebaseToken: eyJhbGciOiJSUzI1NiIs...
+              LocationId: "1234"
+              PartyID: ABC
+              CountryCode: IL
+      responses:
+        "200":
+          description: Success when `ErrorCode` is 0; failure when `ErrorCode > 0`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GetLocationDetailsResponse"
+
+  /sendCommand:
+    post:
+      tags: [Sessions]
+      operationId: sendCommand
+      summary: Start or stop a charging session
+      description: |
+        Sends an OCPI remote command to a charger.
+
+        **START_SESSION** — `commandId` is omitted; the response `CommandId` becomes the session id for the rest of
+        the flow (`getCommandStatus.commandId`, `STOP_SESSION.commandId`, `Cdr.SessionId`). A response without
+        `CommandId` is a failure. Client timeout 180 s, 3 retries (3–10 s random delay).
+        If anything fails after a successful start, nx-charge immediately sends `STOP_SESSION`.
+
+        **STOP_SESSION** — `commandId` is the session id. Sent when the session is no longer `ACTIVE`, the car's
+        credit runs out, monitoring fails, or `POST /stop_session` is called. Client timeout 30 s, 3 retries.
+        The response body is not used beyond the `ErrorCode` check.
+
+        **Values nx-charge sends today**
+        | field | START_SESSION | STOP_SESSION |
+        |---|---|---|
+        | `LocationId` | raw Cloudwise location `Id` | location id stored on the session; for API-started sessions this is the composite id `{Id}-{PartyId}-{Country}` |
+        | `PartyID` | location party (auto start); **omitted** on API start | **omitted** |
+        | `CountryCode` | always `IL` | always `IL` |
+        | `evseUid` / `connectorId` | chosen EVSE `Uid` / connector `Id` | same values as the start |
+        | `ignoreDistanceCheck` | always `false` | always `false` |
+        | `Latitude` / `Longitude` | always `0` | always `0` |
+        | `BleId` / `DeviceId` / `AssetId` | account identity from config | account identity from config |
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SendCommandRequest"
+            examples:
+              start:
+                summary: START_SESSION
+                value:
+                  FirebaseToken: eyJhbGciOiJSUzI1NiIs...
+                  command: START_SESSION
+                  LocationId: "1234"
+                  PartyID: ABC
+                  CountryCode: IL
+                  evseUid: IL*ABC*E1234*1
+                  connectorId: "1"
+                  ignoreDistanceCheck: false
+                  BleId: BLE_ID_FROM_CONFIG
+                  DeviceId: DEVICE_ID_FROM_CONFIG
+                  AssetId: ASSET_ID_FROM_CONFIG
+                  Latitude: 0
+                  Longitude: 0
+              stop:
+                summary: STOP_SESSION
+                value:
+                  FirebaseToken: eyJhbGciOiJSUzI1NiIs...
+                  command: STOP_SESSION
+                  LocationId: "1234"
+                  CountryCode: IL
+                  commandId: "8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f"
+                  evseUid: IL*ABC*E1234*1
+                  connectorId: "1"
+                  ignoreDistanceCheck: false
+                  BleId: BLE_ID_FROM_CONFIG
+                  DeviceId: DEVICE_ID_FROM_CONFIG
+                  AssetId: ASSET_ID_FROM_CONFIG
+                  Latitude: 0
+                  Longitude: 0
+      responses:
+        "200":
+          description: Success when `ErrorCode` is 0; failure when `ErrorCode > 0`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SendCommandResponse"
+
+  /getCommandStatus:
+    post:
+      tags: [Sessions]
+      operationId: getCommandStatus
+      summary: Progress / final state of a charging session
+      description: |
+        **Called by nx-charge**:
+        - Every 30 s for each active session (4 retries, 10–20 s random delay). Updates the session's kWh, cost and
+          charging time, and checks the car's credit balance against the running `Cost`.
+        - Once, 20 s after `STOP_SESSION`, to collect the final numbers and the `Cdr` (if returned the car is billed from it).
+
+        **Interpretation**: the session is treated as running while `CommandStatus` contains `ACTIVE`; anything else
+        ends it. After stop, the final data is stored only when `CommandStatus` contains `COMPLETED`.
+        `Kwh`, `Cost` and `ChargingTimeInSeconds` arrive as **strings** and are parsed as numbers (invalid → 0).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GetCommandStatusRequest"
+            example:
+              FirebaseToken: eyJhbGciOiJSUzI1NiIs...
+              assetId: ASSET_ID_FROM_CONFIG
+              BleId: BLE_ID_FROM_CONFIG
+              commandId: "8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f"
+              deviceId: DEVICE_ID_FROM_CONFIG
+      responses:
+        "200":
+          description: Success when `ErrorCode` is 0; failure when `ErrorCode > 0`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GetCommandStatusResponse"
+              examples:
+                active:
+                  summary: Session in progress
+                  value:
+                    ErrorCode: 0
+                    ErrorMessage: ""
+                    ErrorProvider: 0
+                    Count: 1
+                    RequestID: req-123
+                    ServerTime: "2026-10-21T08:15:30.000Z"
+                    CommandStatus: ACTIVE
+                    Status: ACTIVE
+                    ChargingTimeInSeconds: "754"
+                    CommandId: "8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f"
+                    SessionId: "8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f"
+                    Kwh: "4.215"
+                    Cost: "10.90"
+                completed:
+                  summary: Session completed, CDR attached
+                  value:
+                    ErrorCode: 0
+                    ErrorMessage: ""
+                    ErrorProvider: 0
+                    Count: 1
+                    RequestID: req-124
+                    ServerTime: "2026-10-21T09:02:11.000Z"
+                    CommandStatus: COMPLETED
+                    Status: COMPLETED
+                    ChargingTimeInSeconds: "3600"
+                    CommandId: "8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f"
+                    SessionId: "8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f"
+                    Kwh: "20.000"
+                    Cost: "33.00"
+                    Cdr: &cdr_example
+                      OcpCountryCode: IL
+                      OcpPartyId: ABC
+                      Id: cdr-000123
+                      StartDateTime: "2026-10-21T08:02:11.000Z"
+                      EndDateTime: "2026-10-21T09:02:11.000Z"
+                      SessionId: "8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f"
+                      AuthMethod: AUTH_REQUEST
+                      AuthorizationReference: null
+                      Currency: ILS
+                      TotalCost: 33
+                      TotalCostWithVat: 38.61
+                      TotalCostExcVat: 33
+                      TotalFixCost: 5
+                      TotalFixCostWithVat: 5.85
+                      TotalEnergy: 20
+                      TotalEnergyCost: 28
+                      TotalEnergyCostWithVat: 32.76
+                      TotalTime: 3600
+                      TotalTimeCost: null
+                      TotalTimeCostWithVat: null
+                      TotalParkingTime: null
+                      TotalParkingCost: null
+                      TotalParkingCostWithVat: null
+                      TotalReservationCost: null
+                      TotalReservationCostWithVat: null
+                      CdrTokenCountryCode: IL
+                      CdrTokenPartyId: ABC
+                      CdrTokenUid: null
+                      CdrTokenType: RFID
+                      CdrTokenContractId: null
+                      InvoiceReferenceId: null
+                      CreditsBalance: null
+                      CreditsExpirationDate: null
+                      Credit: false
+                      CreditReferenceId: null
+                      HomeCharging: false
+                      LastUpdated: "2026-10-21T09:05:00.000Z"
+                      AvgKwhPrice: 1.65
+                      Duration: "01:00:00"
+
+  /getUserCdrs:
+    post:
+      tags: [CDRs]
+      operationId: getUserCdrs
+      summary: All CDRs of the account
+      description: |
+        **Called by nx-charge**: every 5 minutes (`task__collect_charge_cdrs`) with the fixed values shown in the
+        example. Each finished session that has no CDR yet is matched to a CDR by `Cdr.SessionId == session id`;
+        the car is then billed by `TotalCost` (minus what was already billed from `getCommandStatus`), and the CDR is
+        stored in Firestore `nx-charge-cdrs` under its `Id`.
+
+        **Response fields used**: `Items[]` → `Id`, `SessionId`, `OcpPartyId`, `StartDateTime`, `EndDateTime`,
+        `LastUpdated`, `Currency`, `TotalCost`, `TotalCostWithVat`, `TotalFixCost`, `TotalFixCostWithVat`,
+        `TotalEnergy`, `TotalTime`, `TotalParkingTime`, `AvgKwhPrice`, `Duration`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GetUserCdrsRequest"
+            example:
+              FirebaseToken: eyJhbGciOiJSUzI1NiIs...
+              skip: 0
+              pageSize: 99999999
+              assetId: ASSET_ID_FROM_CONFIG
+              timeZone: 0
+      responses:
+        "200":
+          description: Success when `ErrorCode` is 0; failure when `ErrorCode > 0`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GetUserCdrsResponse"
+
+components:
+  examples:
+    CdrItem:
+      value: *cdr_example
+
+  schemas:
+    # ---------------- auth ----------------
+    SignInRequest:
+      type: object
+      required: [email, password, returnSecureToken]
+      properties:
+        email:
+          type: string
+          format: email
+          description: Cloudwise account email (`nx-settings/cloudwise.email`).
+        password:
+          type: string
+          format: password
+          description: Cloudwise account password (`nx-settings/cloudwise.password`).
+        returnSecureToken:
+          type: boolean
+          enum: [true]
+    SignInResponse:
+      type: object
+      description: Standard Firebase Auth response. nx-charge uses only `idToken`.
+      required: [idToken]
+      properties:
+        idToken:
+          type: string
+          description: Firebase ID token — sent as `FirebaseToken` in every Cloudwise request.
+        refreshToken:
+          type: string
+        expiresIn:
+          type: string
+          example: "3600"
+        localId:
+          type: string
+        email:
+          type: string
+
+    # ---------------- shared ----------------
+    AuthenticatedRequest:
+      type: object
+      required: [FirebaseToken]
+      properties:
+        FirebaseToken:
+          type: string
+          description: Firebase `idToken` from `signInWithPassword`.
+    CloudwiseResponse:
+      type: object
+      description: Envelope returned by every Cloudwise endpoint.
+      required: [ErrorCode]
+      properties:
+        ErrorCode:
+          type: integer
+          description: 0 = success. Any value > 0 is treated by nx-charge as a failure.
+        ErrorMessage:
+          type: string
+          nullable: true
+        ErrorProvider:
+          type: integer
+        Count:
+          type: integer
+        RequestID:
+          type: string
+        ServerTime:
+          type: string
+          format: date-time
+
+    # ---------------- requests ----------------
+    GetLocationsRequest:
+      allOf:
+        - $ref: "#/components/schemas/AuthenticatedRequest"
+        - type: object
+          required: [lat, lon, radius, Skip, PageSize, TimeZone]
+          properties:
+            lat:
+              type: number
+              description: Center latitude. nx-charge sends 0.
+            lon:
+              type: number
+              description: Center longitude. nx-charge sends 0.
+            radius:
+              type: integer
+              description: Radius in meters. nx-charge sends 10000.
+            Skip:
+              type: integer
+              description: Paging offset. nx-charge sends 0.
+            PageSize:
+              type: integer
+              description: Page size. nx-charge sends 99999999 (everything in one page).
+            TimeZone:
+              type: integer
+              description: Time-zone offset. nx-charge sends 0.
+    GetLocationDetailsRequest:
+      allOf:
+        - $ref: "#/components/schemas/AuthenticatedRequest"
+        - type: object
+          required: [LocationId, PartyID, CountryCode]
+          properties:
+            LocationId:
+              type: string
+              description: Raw Cloudwise location `Id` (not the composite nx-charge id).
+            PartyID:
+              type: string
+              description: Location party id (`PartyId` from `getLocations`).
+            CountryCode:
+              type: string
+              description: Always `IL`.
+              example: IL
+    SendCommandRequest:
+      allOf:
+        - $ref: "#/components/schemas/AuthenticatedRequest"
+        - type: object
+          required: [command, LocationId, CountryCode, evseUid, connectorId, ignoreDistanceCheck, BleId, DeviceId, AssetId, Latitude, Longitude]
+          properties:
+            command:
+              $ref: "#/components/schemas/SessionCommand"
+            LocationId:
+              type: string
+              description: Location id. See the table in the operation description for the exact value per case.
+            PartyID:
+              type: string
+              description: Location party id. Sent only on auto START_SESSION; omitted on API start and on STOP_SESSION.
+            CountryCode:
+              type: string
+              description: Always `IL`.
+            commandId:
+              type: string
+              description: Session id (= `CommandId` returned by START_SESSION). Required for STOP_SESSION; omitted for START_SESSION.
+            evseUid:
+              type: string
+              description: EVSE `Uid`.
+            connectorId:
+              type: string
+              description: Connector `Id` within the EVSE.
+            ignoreDistanceCheck:
+              type: boolean
+              description: Always `false`.
+            BleId:
+              type: string
+              description: Account BLE id (`nx-settings/cloudwise.ble_id`).
+            DeviceId:
+              type: string
+              description: Account device id (`nx-settings/cloudwise.device_id`).
+            AssetId:
+              type: string
+              description: Account asset id (`nx-settings/cloudwise.asset_id`).
+            Latitude:
+              type: number
+              description: Always `0`.
+            Longitude:
+              type: number
+              description: Always `0`.
+    GetCommandStatusRequest:
+      allOf:
+        - $ref: "#/components/schemas/AuthenticatedRequest"
+        - type: object
+          required: [assetId, BleId, commandId, deviceId]
+          properties:
+            assetId:
+              type: string
+              description: Account asset id.
+            BleId:
+              type: string
+              description: Account BLE id.
+            commandId:
+              type: string
+              description: Session id (= `CommandId` returned by START_SESSION).
+            deviceId:
+              type: string
+              description: Account device id.
+    GetUserCdrsRequest:
+      allOf:
+        - $ref: "#/components/schemas/AuthenticatedRequest"
+        - type: object
+          required: [skip, pageSize, assetId, timeZone]
+          properties:
+            skip:
+              type: integer
+              description: Paging offset. nx-charge sends 0.
+            pageSize:
+              type: integer
+              description: Page size. nx-charge sends 99999999.
+            assetId:
+              type: string
+              description: Account asset id.
+            timeZone:
+              type: integer
+              description: Time-zone offset. nx-charge sends 0.
+
+    # ---------------- responses ----------------
+    GetLocationsResponse:
+      allOf:
+        - $ref: "#/components/schemas/CloudwiseResponse"
+        - type: object
+          properties:
+            Items:
+              type: array
+              items:
+                $ref: "#/components/schemas/OcpiLocation"
+    GetLocationDetailsResponse:
+      allOf:
+        - $ref: "#/components/schemas/CloudwiseResponse"
+        - type: object
+          required: [Location]
+          properties:
+            Location:
+              type: object
+              description: Wrapper (note the nested `Location.Location`).
+              required: [Location, Evses]
+              properties:
+                Location:
+                  $ref: "#/components/schemas/Location"
+                Evses:
+                  type: array
+                  items:
+                    $ref: "#/components/schemas/Evse"
+                ErrorMessage:
+                  type: string
+                  nullable: true
+                ErrorCode:
+                  type: integer
+    SendCommandResponse:
+      allOf:
+        - $ref: "#/components/schemas/CloudwiseResponse"
+        - type: object
+          properties:
+            CommandId:
+              type: string
+              description: Session id. Required in a successful START_SESSION response.
+    GetCommandStatusResponse:
+      allOf:
+        - $ref: "#/components/schemas/CloudwiseResponse"
+        - type: object
+          required: [CommandStatus]
+          properties:
+            CommandStatus:
+              $ref: "#/components/schemas/CommandStatus"
+            Status:
+              type: string
+              description: Textual status (not used by nx-charge).
+            ChargingTimeInSeconds:
+              type: string
+              description: Charging time in seconds, as a numeric string.
+              example: "754"
+            CommandId:
+              type: string
+              description: Session id.
+            SessionId:
+              type: string
+            Kwh:
+              type: string
+              description: Energy delivered so far, as a numeric string.
+              example: "4.215"
+            Cost:
+              type: string
+              description: Cost so far (ILS), as a numeric string. Compared live against the car's credit balance.
+              example: "10.90"
+            Cdr:
+              $ref: "#/components/schemas/CdrItem"
+    GetUserCdrsResponse:
+      allOf:
+        - $ref: "#/components/schemas/CloudwiseResponse"
+        - type: object
+          properties:
+            Items:
+              type: array
+              items:
+                $ref: "#/components/schemas/CdrItem"
+
+    # ---------------- enums ----------------
+    SessionCommand:
+      type: string
+      enum: [START_SESSION, STOP_SESSION]
+    CommandStatus:
+      type: string
+      description: nx-charge checks with `includes`, so `ACTIVE` = running, `COMPLETED` = finished, anything else = finished.
+      enum: [ACTIVE, COMPLETED, FAILED]
+    EvseStatus:
+      type: string
+      description: |
+        OCPI EVSE status. A charger with a car plugged in and waiting for a start command reports `BLOCKED` or
+        `PREPARING` — those are the only statuses nx-charge starts a session on.
+        The app shows only `AVAILABLE`, `PREPARING`, `BLOCKED`, `CHARGING`.
+      enum: [AVAILABLE, PREPARING, BLOCKED, CHARGING, INOPERATIVE, OUTOFORDER, UNKNOWN, PLANNED]
+    ConnectorFormat:
+      type: string
+      description: "`CABLE` = cable attached to the charger; `SOCKET` = driver brings a cable."
+      enum: [CABLE, SOCKET]
+    ConnectorStandard:
+      type: string
+      description: |
+        OCPI connector standard. Values seen / handled by nx-charge: `IEC_62196_T2`, `IEC_62196_T2_COMBO`, `CHADEMO`,
+        `IEC_62196_T1_COMBO`, `DOMESTIC_A`, `DOMESTIC_C`. The app lists only `IEC_62196_T2` and `IEC_62196_T2_COMBO`;
+        auto start avoids `CHADEMO` when the EVSE has another connector.
+      example: IEC_62196_T2
+
+    # ---------------- location model ----------------
+    Location:
+      type: object
+      properties:
+        Id:
+          type: string
+          description: Cloudwise location id (unique only together with party + country).
+        OwnerCountryCode:
+          type: string
+        OwnerPartyId:
+          type: string
+        Publish:
+          type: boolean
+        Name:
+          type: string
+        Address:
+          type: string
+        City:
+          type: string
+        State:
+          type: string
+        Country:
+          type: string
+        OperatorName:
+          type: string
+          description: Used as the company name in `getLocationDetails` results.
+        OwnerName:
+          type: string
+        Latitude:
+          type: number
+        Longitude:
+          type: number
+        Facilities:
+          type: string
+          nullable: true
+        OpeningTimes:
+          type: string
+        ParkingType:
+          type: string
+        Images:
+          type: string
+          nullable: true
+        LastUpdated:
+          type: string
+          format: date-time
+    OcpiLocation:
+      description: Location as returned by `getLocations`.
+      allOf:
+        - $ref: "#/components/schemas/Location"
+        - type: object
+          properties:
+            PostalCode:
+              type: string
+            Type:
+              type: string
+              nullable: true
+            RelatedLocations:
+              type: string
+              nullable: true
+            EnergyMix:
+              type: string
+              nullable: true
+            PartyId:
+              type: string
+              description: Party (CPO) id. Needed as `PartyID` in `getLocationDetails` / `sendCommand`.
+            CountryCode:
+              type: string
+            CompanyName:
+              type: string
+              description: Charging company name shown in the app.
+            OcpiEvses:
+              type: array
+              items:
+                $ref: "#/components/schemas/OcpiEvse"
+    EvseBase:
+      type: object
+      properties:
+        Uid:
+          type: string
+          description: EVSE unique id — sent as `evseUid` in `sendCommand`.
+        LocationId:
+          type: string
+        EvseId:
+          type: string
+          description: Human-readable EVSE id, e.g. `IL*ABC*E1234*1`.
+        Status:
+          $ref: "#/components/schemas/EvseStatus"
+        FloorLevel:
+          type: string
+          nullable: true
+        Latitude:
+          type: number
+        Longitude:
+          type: number
+        PhysicalReference:
+          type: string
+          nullable: true
+          description: Label printed on the charger.
+        Directions:
+          type: string
+          nullable: true
+        ParkingRestrictions:
+          type: string
+          nullable: true
+        Images:
+          type: string
+          nullable: true
+        LastUpdated:
+          type: string
+          format: date-time
+          description: Last status change. Used to match a plugged-in car to the EVSE whose status changed closest to the plug-in time.
+    Evse:
+      description: EVSE as returned by `getLocationDetails` (with tariffs).
+      allOf:
+        - $ref: "#/components/schemas/EvseBase"
+        - type: object
+          properties:
+            Capabilities:
+              type: string
+            Description:
+              type: array
+              items:
+                type: string
+            Connectors:
+              type: array
+              items:
+                $ref: "#/components/schemas/Connector"
+    OcpiEvse:
+      description: EVSE as returned by `getLocations` (no tariffs).
+      allOf:
+        - $ref: "#/components/schemas/EvseBase"
+        - type: object
+          properties:
+            OcpiConnectors:
+              type: array
+              items:
+                $ref: "#/components/schemas/OcpiConnector"
+    OcpiConnector:
+      type: object
+      description: Connector as returned by `getLocations`.
+      properties:
+        Id:
+          type: string
+          description: Connector id within the EVSE — sent as `connectorId` in `sendCommand`.
+        EvseUid:
+          type: string
+        Standard:
+          $ref: "#/components/schemas/ConnectorStandard"
+        Format:
+          $ref: "#/components/schemas/ConnectorFormat"
+        PowerType:
+          type: string
+          example: AC_3_PHASE
+        MaxVoltage:
+          type: number
+        MaxAmperage:
+          type: number
+        MaxElectricPower:
+          type: number
+        TermsAndConditions:
+          type: string
+          nullable: true
+        TariffId:
+          type: string
+        LastUpdated:
+          type: string
+          format: date-time
+    Connector:
+      description: Connector as returned by `getLocationDetails` (adds pricing).
+      allOf:
+        - $ref: "#/components/schemas/OcpiConnector"
+        - type: object
+          properties:
+            PricePerKwh:
+              type: number
+            ConnectionFee:
+              type: number
+            ParkingFee:
+              type: number
+            TariffDetails:
+              $ref: "#/components/schemas/TariffDetails"
+    TariffDetails:
+      type: object
+      properties:
+        PricePerKwh:
+          type: number
+        ConnectionFee:
+          type: number
+        ParkingFee:
+          type: number
+          nullable: true
+        Currency:
+          type: string
+          example: ILS
+        TariffItems:
+          type: array
+          items:
+            $ref: "#/components/schemas/TariffItem"
+        ErrorMessage:
+          type: string
+          nullable: true
+        ErrorCode:
+          type: integer
+    TariffItem:
+      type: object
+      properties:
+        Text:
+          type: string
+          nullable: true
+        Currency:
+          type: string
+        Prices:
+          type: array
+          items:
+            type: object
+            properties:
+              Type:
+                type: integer
+              Price:
+                type: number
+              Vat:
+                type: number
+        From:
+          type: string
+          format: date-time
+        To:
+          type: string
+          format: date-time
+        DaysOfWeek:
+          type: array
+          items:
+            type: string
+
+    # ---------------- CDR ----------------
+    CdrItem:
+      type: object
+      description: Charge Detail Record — the final, billable record of a session.
+      properties:
+        OcpCountryCode:
+          type: string
+        OcpPartyId:
+          type: string
+          description: Charging operator party id.
+        Id:
+          type: string
+          description: CDR id.
+        StartDateTime:
+          type: string
+          format: date-time
+        EndDateTime:
+          type: string
+          format: date-time
+        SessionId:
+          type: string
+          description: Equals the `CommandId` returned by START_SESSION. The join key between sessions and CDRs.
+        AuthMethod:
+          type: string
+          nullable: true
+        AuthorizationReference:
+          type: string
+          nullable: true
+        Currency:
+          type: string
+          example: ILS
+        TotalCost:
+          type: number
+          description: Amount billed to the car.
+        TotalCostWithVat:
+          type: number
+        TotalCostExcVat:
+          type: number
+          nullable: true
+        TotalFixCost:
+          type: number
+        TotalFixCostWithVat:
+          type: number
+        TotalEnergy:
+          type: number
+          description: kWh.
+        TotalEnergyCost:
+          type: number
+        TotalEnergyCostWithVat:
+          type: number
+        TotalTime:
+          type: number
+        TotalTimeCost:
+          type: number
+          nullable: true
+        TotalTimeCostWithVat:
+          type: number
+          nullable: true
+        TotalParkingTime:
+          type: number
+          nullable: true
+        TotalParkingCost:
+          type: number
+          nullable: true
+        TotalParkingCostWithVat:
+          type: number
+          nullable: true
+        TotalReservationCost:
+          type: number
+          nullable: true
+        TotalReservationCostWithVat:
+          type: number
+          nullable: true
+        CdrTokenCountryCode:
+          type: string
+        CdrTokenPartyId:
+          type: string
+        CdrTokenUid:
+          type: string
+          nullable: true
+        CdrTokenType:
+          type: string
+          nullable: true
+        CdrTokenContractId:
+          type: string
+          nullable: true
+        InvoiceReferenceId:
+          type: string
+          nullable: true
+        CreditsBalance:
+          type: number
+          nullable: true
+        CreditsExpirationDate:
+          type: string
+          nullable: true
+        Credit:
+          type: boolean
+        CreditReferenceId:
+          type: string
+          nullable: true
+        HomeCharging:
+          type: boolean
+        LastUpdated:
+          type: string
+          format: date-time
+        AvgKwhPrice:
+          type: number
+        Duration:
+          type: string
+          description: "Format `HH:mm:ss`."
+          example: "01:00:00"
