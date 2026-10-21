@@ -1,45 +1,159 @@
 openapi: 3.0.3
 info:
   title: Cloudwise API — as consumed by nx-charge
-  version: "1.1.28"
+  version: "1.1.29"
   description: |
-    Contract of every outbound call the `nx-charge` service makes to Cloudwise (EV charging / OCPI aggregator),
-    derived from the nx-charge source code (`src/charge/cloudwise_api`) at version 1.1.28.
-    It documents exactly what nx-charge sends and which response fields it relies on.
+    Contract of every outbound call the `nx-charge` service makes to Cloudwise, derived from the nx-charge source code
+    (`src/charge`) at version 1.1.29 and from 30 days of production logs (2026-09-21 → 2026-10-21).
+    Each endpoint below has three parts: what it is, **Preconditions** (what must be true before calling it) and
+    **Practical usage** (when nx-charge calls it, why, and what it does with every possible result).
 
-    ## Conventions shared by every Cloudwise endpoint
+    # 1. Overview — what this integration does
+    **Plug & Charge**: the driver of a car with an Akeyless unit plugs the car into a public charger that is connected to
+    Cloudwise, and charging starts by itself — no app, no RFID card, no payment at the charger. The session is paid from
+    the car's prepaid charging credits held by Akeyless.
+
+    How it works:
+    - **Cloudwise** is a roaming aggregator. It is connected over OCPI to many Charge Point Operators (CPOs) and exposes
+      one API for: the charger catalog, live charger status, remote start / stop, session progress and the final
+      billing record (CDR).
+    - **Akeyless holds a single account at Cloudwise.** Every session of every car runs under that account, identified by
+      fixed `AssetId` / `BleId` / `DeviceId` values. Cloudwise bills Akeyless; Akeyless bills each car from its credits.
+    - **Cloudwise does not know which car is plugged into which charger.** nx-charge infers it: the car reports
+      "plugged in" with its GPS position and time; nx-charge looks for a nearby EVSE (charging point) that has just moved
+      to an "occupied, waiting for authorization" status (`BLOCKED` / `PREPARING`) and starts the session on it.
+
+    # 2. Actors
+    | actor | role |
+    |---|---|
+    | Car + Akeyless unit | reports plug-in / plug-out from the CAN bus, with GPS position |
+    | Akeyless data pipeline | writes the car's charging state to Firestore `nx-charge-state/{car_number}` |
+    | **nx-charge** | the orchestrator documented here: decides when to start / stop, talks to Cloudwise, bills the car |
+    | Cloudwise | aggregator API (this document) |
+    | CPO / charger | the physical charger; executes remote start / stop and reports status |
+    | nx-end-users service | holds each car's credits (type `charge_external`); balance and subtract APIs |
+    | Firestore | `nx-charge-locations` (catalog), `nx-charge-sessions`, `nx-charge-state`, `nx-charge-cdrs` |
+
+    # 3. Lifecycle of one charging session
+    **Always-on background jobs** (run only on the instance with env `run_tasks=true`):
+    - Log in to Cloudwise on boot and every 60 minutes.
+    - Refresh the charger catalog every 3 minutes.
+    - Reconcile final billing records (CDRs) every 5 minutes.
+
+    **One session, step by step**
+    1. **Plug-in detected.** `nx-charge-state/{car_number}` changes to `ocpi_status: "plugin"` with `lat`, `lng`,
+       `timestamp`. The car's unit must have the feature `plug_and_charge`; nx-charge checks it when the car's state
+       document first appears and on service boot, not again on later plug-in events of a car it already tracks.
+    2. **Credit check.** The car's credit balance must be above `credit_balance_threshold`. Otherwise the car state
+       becomes `error` and nothing is sent to Cloudwise.
+    3. **Find the charger.** Catalog locations within `radius_in_meters` of the car → live status of each one → EVSEs in
+       `BLOCKED` or `PREPARING` → the EVSE whose last status change is closest to the plug-in time wins. If the EVSE has
+       several connectors, a non-`CHADEMO` one is preferred. If nothing matches, the search is repeated up to 5 times,
+       5–10 s apart, widening the radius by 50 m each time. Still nothing → car state `error`.
+    4. **Remote start** on that EVSE and connector. Cloudwise returns a `CommandId` — this is the **session id** for the
+       rest of the flow. nx-charge writes `nx-charge-sessions/{session_id}` (`status: started`) and sets the car state
+       to `charging`.
+    5. **Monitor** every 30 s: kWh, running cost and charging time are saved on the session, and the credit balance is
+       checked against `credit_balance_threshold + running cost`.
+    6. **The session ends** when any of these happens:
+       - Cloudwise stops reporting the session as `ACTIVE` (driver unplugged, charger finished, charger fault).
+       - The car's credit can no longer cover the running cost.
+       - Monitoring fails (Cloudwise unreachable after retries).
+       - A manual stop through nx-charge's API.
+       - A new plug-in event arrives while a session is active (the running session is stopped as `error`, then a new
+         start flow runs).
+
+       Note: the car's own `plugout` event does **not** end a session — nx-charge waits for Cloudwise to report it.
+    7. **Remote stop**, then the running cost is charged from the car's credits. The session becomes `paid` (or stays
+       `completed` / `error` if charging the credits failed); the car state gets the final status and its `session_id`
+       is cleared.
+    8. **Final billing.** 20 s after the stop, nx-charge asks Cloudwise once more for the final status and the CDR. If a
+       CDR is returned, the car is charged the difference between the CDR's `TotalCost` and what was already charged,
+       and the CDR is stored. If not, the 5-minute CDR job picks it up later.
+
+    **Alternative entry — start from the app** (`POST /api/charge/sessions/start`): the user picks location, EVSE and
+    connector. Same credit check; nx-charge verifies the live EVSE status is `BLOCKED` / `PREPARING` and sends the
+    remote start. Steps 4–8 are identical. No plug-in event and no `plug_and_charge` feature check are involved.
+
+    **Recovery after a restart.** On boot, every car whose state is `charging` with a `session_id` resumes monitoring,
+    and every car whose state is `plugin` starts the flow from step 2.
+
+    # 4. nx-charge states (internal, not sent to Cloudwise)
+    **Car state** — `nx-charge-state/{car_number}.ocpi_status`
+    | value | meaning |
+    |---|---|
+    | `plugin` | car reported plugged in → triggers the start flow |
+    | `charging` | a session was started (`session_id` set) → triggers monitoring |
+    | `completed` | last session ended, running cost not charged |
+    | `paid` | last session ended and was charged |
+    | `error` | start failed, or the session ended with an error; `message` holds the reason |
+    | `plugout` | car reported unplugged (no action) |
+
+    **Session status** — `nx-charge-sessions/{session_id}.status`
+    | value | meaning |
+    |---|---|
+    | `started` | remote start accepted by Cloudwise |
+    | `completed` | stopped; charging the credits failed or is pending |
+    | `error` | stopped because of a failure; `message` holds the reason |
+    | `paid` | stopped and charged (running cost, and later the CDR difference) |
+
+    # 5. Money flow
+    | moment | rule |
+    |---|---|
+    | before start | balance > `credit_balance_threshold` |
+    | during the session | balance > `credit_balance_threshold` + running `Cost`, otherwise stop |
+    | at stop | charge the last running `Cost` reported by Cloudwise |
+    | when the CDR arrives | charge CDR `TotalCost` minus what was charged at stop (the CDR is the source of truth) |
+
+    Credits are consumed from a single credit that covers the amount if one exists, otherwise spread across several credits.
+
+    # 6. Conventions shared by every Cloudwise endpoint
     - **Method**: always `POST`, JSON body, `Content-Type: application/json`.
-    - **Authentication**: no header. Every request body carries `FirebaseToken` — the Firebase ID token
-      obtained from the `signInWithPassword` call (tag *Auth*). The token is refreshed every hour.
-    - **Errors**: Cloudwise reports business errors inside an HTTP 200 body. nx-charge treats any response with
-      `ErrorCode > 0` as a failure (the whole body becomes the error message). Transport errors / non-2xx are failures too.
+    - **Authentication**: no header. Every request body carries `FirebaseToken` — the Firebase ID token obtained from
+      `signInWithPassword` (tag *Auth*).
+    - **Errors come inside an HTTP 200 body**: `ErrorCode > 0` means failure (see schema `CloudwiseErrorCode` for the
+      codes seen in production). nx-charge throws with the whole body as the message. Network errors and timeouts are
+      failures too; in production these are mostly `ECONNRESET` on `getLocations` and `ECONNABORTED` (client timeout)
+      on `getUserCdrs` / `getCommandStatus`.
     - **Field casing is inconsistent between endpoints** (`Skip` vs `skip`, `BleId` vs `deviceId`, `lon` vs `Longitude`).
       The names below are exactly what nx-charge sends today; do not normalize them.
     - **Client timeout**: 30 s, except `sendCommand` with `START_SESSION` (180 s).
-    - **Identity of the charging account**: `AssetId`, `BleId` and `DeviceId` are fixed values of the single
-      Akeyless account at Cloudwise, read from Firestore `nx-settings/cloudwise` (`asset_id`, `ble_id`, `device_id`).
-      They are the same for every car; the car itself is never sent to Cloudwise.
+    - **Account identity**: `AssetId`, `BleId` and `DeviceId` are the same for every car. The car itself is never sent
+      to Cloudwise; nx-charge keeps the car ↔ session mapping in Firestore.
 
-    ## Configuration (Firestore `nx-settings/cloudwise`)
+    # 7. Configuration (Firestore `nx-settings/cloudwise`)
     | key | used for |
     |---|---|
     | `base_url` | server URL of every Cloudwise endpoint (`{base_url}/{endpoint}`) |
     | `login_key` | Firebase Web API key for `signInWithPassword` |
     | `email`, `password` | Cloudwise account credentials |
-    | `asset_id`, `ble_id`, `device_id` | account identity sent in session / CDR calls |
+    | `asset_id`, `ble_id`, `device_id` | account identity sent in session and CDR calls |
+    | `radius_in_meters` | initial search radius around the car for the charger match |
+    | `credit_balance_threshold` | minimum credit balance kept above the running cost |
+    | `simulator_list` | car numbers whose Cloudwise calls are answered by an internal simulator instead |
 
-    ## Business flows
-    1. **Auth** — on boot and every 60 min: `signInWithPassword` → `idToken` → used as `FirebaseToken`.
-    2. **Location catalog sync** — every 3 min: `getLocations` → full catalog stored in Firestore `nx-charge-locations`.
-    3. **Start session** (car plugged in, detected from CAN bus, or `POST /start_session` API):
-       `getLocationDetails` for candidate locations (live EVSE status) → pick the EVSE in status `BLOCKED`/`PREPARING`
-       → `sendCommand` `START_SESSION` → returned `CommandId` is the session id.
-    4. **Monitor active session** — every 30 s while active: `getCommandStatus` → kWh / cost / time.
-       Session ends when `CommandStatus` is no longer `ACTIVE`, or when the car's credit balance runs out.
-    5. **Stop session** — `sendCommand` `STOP_SESSION` with the session id as `commandId`;
-       20 s later `getCommandStatus` once more to collect the final cost and the `Cdr`, if present.
-    6. **CDR reconciliation** — every 5 min: `getUserCdrs` → matched to finished sessions by `SessionId`
-       (= the `CommandId` from step 3) → the car is billed by the CDR's `TotalCost`.
+    # 8. Known issues found while documenting
+    - **Token refresh equals token lifetime** (60 min): `401 Authentication error` was returned 3 times in 30 days by
+      the periodic jobs.
+    - **Remote start has no idempotency key**: a `START_SESSION` that times out is retried with a new request
+      (14 `ETIMEDOUT` in 30 days); if the first one was accepted, a second start can be sent.
+    - **App-started sessions**: `STOP_SESSION` sends the composite location id `{Id}-{PartyId}-{Country}` and no
+      `PartyID`; `START_SESSION` from the app sends no `PartyID`.
+    - **A failed remote stop leaves the session `started`** in Firestore: it is not charged and the CDR job skips it.
+    - **CDR job write order**: when a CDR is found only by the 5-minute job, the session and CDR documents are added to a
+      Firestore batch after the batch was committed, so they are not saved and the session can be charged again on the
+      next run. Not seen in the last 30 days of logs (CDRs arrived through the stop flow).
+    - **Full history on every run**: `getLocations` and `getUserCdrs` fetch everything every 3 / 5 minutes.
+
+    # 9. Endpoint map
+    | step | endpoint |
+    |---|---|
+    | log in | `signInWithPassword` |
+    | charger catalog | `getLocations` |
+    | live charger status (find / validate the EVSE) | `getLocationDetails` |
+    | remote start / stop | `sendCommand` |
+    | session progress and final CDR | `getCommandStatus` |
+    | final billing records | `getUserCdrs` |
 servers:
   - url: "{base_url}"
     description: Cloudwise API. Value comes from Firestore `nx-settings/cloudwise.base_url`.
@@ -51,7 +165,7 @@ tags:
   - name: Auth
     description: Obtaining the `FirebaseToken` sent in every Cloudwise request.
   - name: Locations
-    description: Charging locations, EVSEs (stations), connectors and tariffs.
+    description: Charging locations, EVSEs (charging points), connectors and tariffs.
   - name: Sessions
     description: Starting / stopping a charging session and polling its progress.
   - name: CDRs
@@ -67,11 +181,26 @@ paths:
       operationId: signInWithPassword
       summary: Log in to Cloudwise and obtain the FirebaseToken
       description: |
-        Standard Firebase Auth REST login against Cloudwise's Firebase project.
-        nx-charge keeps only `idToken` and sends it as `FirebaseToken` in every Cloudwise request.
+        Standard Firebase Auth REST login against Cloudwise's Firebase project. nx-charge keeps only `idToken` and sends
+        it as `FirebaseToken` in every Cloudwise request.
 
-        **Called by nx-charge**: on service boot (boot fails if login fails) and every 60 minutes.
-        The ID token lives 3600 s, so the refresh interval equals the token lifetime.
+        ### Preconditions
+        - `email`, `password` and `login_key` are set in `nx-settings/cloudwise`.
+        - The Akeyless account at Cloudwise is active.
+        - Nothing else — this is the first call of the service and every other call depends on it.
+
+        ### Practical usage
+        **When:** once on service boot, before anything else; then every 60 minutes (only on the instance with
+        `run_tasks=true`).
+
+        **Why:** the ID token expires after 3600 s and every Cloudwise endpoint requires a valid one in `FirebaseToken`.
+
+        **What nx-charge does with the result:**
+        | result | handling |
+        |---|---|
+        | `200` with `idToken` | token cached in memory (`cloudwise-token`) and used by all following calls |
+        | failure on boot (wrong credentials, network) | boot aborts, the process exits and Kubernetes restarts the pod, which logs in again |
+        | failure on the hourly refresh | logged; the previous token keeps being used until it expires, then Cloudwise answers `ErrorCode 401` until the next successful refresh |
       parameters:
         - name: key
           in: query
@@ -105,16 +234,36 @@ paths:
       operationId: getLocations
       summary: List all charging locations (catalog)
       description: |
-        Returns locations with their EVSEs and connectors (OCPI shape, **without tariffs**).
+        Returns locations with their EVSEs and connectors (OCPI shape, **without tariffs**). The EVSE status inside is a
+        snapshot — for a decision that needs the live status use `getLocationDetails`.
 
-        **Called by nx-charge**: on boot and every 3 minutes (`task__collect_charge_locations`), and on demand from
-        `GET /fetch_all_locations`. Always with the fixed values shown in the example
-        (`lat`/`lon` 0, `radius` 10000, `Skip` 0, `PageSize` 99999999, `TimeZone` 0); the result is used as the full
-        location catalog and filtered locally (Israel bounding box, connector standards, party `EDG` excluded).
+        ### Preconditions
+        - A valid `FirebaseToken`.
+        - No other precondition: the call does not depend on any car, session or prior call.
 
-        **Response fields used**: `Items[]` → `Id`, `Name`, `Address`, `Country`, `Latitude`, `Longitude`, `Images`,
-        `PartyId`, `CompanyName`, `OcpiEvses[]` (`Uid`, `EvseId`, `Status`, `FloorLevel`, `PhysicalReference`,
-        `LastUpdated`, `OcpiConnectors[]`). The stored location id is `{Id}-{PartyId}-{Country}`.
+        ### Practical usage
+        **When:** on boot and every 3 minutes (only on the instance with `run_tasks=true`). Always with the fixed values
+        shown in the example (`lat` / `lon` 0, `radius` 10000, `Skip` 0, `PageSize` 99999999, `TimeZone` 0).
+
+        **Why:** keep the full charger catalog in Firestore `nx-charge-locations`. The catalog is used to:
+        - show the charger map in the app (`POST /api/charge/locations/get` reads only the catalog, never Cloudwise);
+        - find candidate locations near a car that just plugged in (distance from the car's GPS);
+        - translate an app location id into the raw Cloudwise `Id` and `PartyId` needed by the other endpoints.
+
+        **What nx-charge does with the result:**
+        | result | handling |
+        |---|---|
+        | `Items` returned | each location becomes document `{Id}-{PartyId}-{Country}`; only new or changed locations are written |
+        | a location missing from `Items` | nothing — its old document stays in the catalog (never deleted) |
+        | `Items` empty | nothing is written; the catalog keeps its last state |
+        | `ErrorCode > 0` (e.g. `401`) or network error / timeout | job run fails and is logged; the catalog keeps its last state; next run in 3 min |
+
+        The app shows only locations inside Israel (lat 29.0–33.5, lng 34.2–35.9), with EVSEs in `AVAILABLE`,
+        `PREPARING`, `BLOCKED` or `CHARGING`, connectors `IEC_62196_T2` / `IEC_62196_T2_COMBO`, and party not `EDG`.
+
+        ### Response fields used
+        `Items[]` → `Id`, `Name`, `Address`, `Country`, `Latitude`, `Longitude`, `Images`, `PartyId`, `CompanyName`,
+        `OcpiEvses[]` (`Uid`, `EvseId`, `Status`, `FloorLevel`, `PhysicalReference`, `LastUpdated`, `OcpiConnectors[]`).
       requestBody:
         required: true
         content:
@@ -143,19 +292,42 @@ paths:
       operationId: getLocationDetails
       summary: Live details of one location (EVSE status + tariffs)
       description: |
-        Returns one location with its EVSEs, connectors and **tariff details**, with the live EVSE status.
+        Returns one location with its EVSEs, connectors and **tariff details**, with the **live** EVSE status.
 
-        **Called by nx-charge**:
-        - Auto start (car plugged in): once per catalog location within `radius_in_meters` of the car
-          (the radius grows by 50 m per retry, up to 5 retries). An EVSE in `BLOCKED` or `PREPARING` is a start candidate;
-          the one whose `LastUpdated` is closest to the plug-in time wins, preferring a non-`CHADEMO` connector.
-        - API start (`POST /start_session`): validates that the requested EVSE / connector exist and that the EVSE is
-          `BLOCKED` or `PREPARING` (3 retries).
-        - `GET /location_status` and `GET /location_details/{id}`: show live status and price to the app.
+        ### Preconditions
+        - A valid `FirebaseToken`.
+        - The location is in the catalog (`getLocations`): nx-charge takes the raw `Id` and `PartyId` from there.
+          Both are required — a location `Id` is unique only within its party.
+        - For the plug-in match: the car's GPS position and plug-in time from `nx-charge-state`, and at least one
+          catalog location within `radius_in_meters` (+50 m per retry).
 
-        **Response fields used**: `Location.Location` (`Id`, `Name`, `Address`, `Country`, `Latitude`, `Longitude`,
-        `Images`, `OperatorName`, `OwnerPartyId`), `Location.Evses[]` (`Uid`, `EvseId`, `Status`, `FloorLevel`,
-        `PhysicalReference`, `LastUpdated`, `Connectors[]` incl. `PricePerKwh`, `ConnectionFee`, `ParkingFee`, `TariffDetails`).
+        ### Practical usage
+        **When and why:**
+        | caller | why |
+        |---|---|
+        | plug-in (automatic start) | called for **every** catalog location near the car, to find the EVSE the car is plugged into |
+        | app start (`POST /api/charge/sessions/start`) | validate that the chosen EVSE and connector exist and are ready to start (up to 3 attempts, 10–20 s apart) |
+        | app location screen (`GET /api/charge/locations/{id}`) | show live EVSE status and prices |
+        | live status lookup (`GET /api/charge/locations/status`) | return the location with every EVSE as is (no status filter) |
+
+        **Which EVSE is chosen on plug-in:** among all EVSEs in `BLOCKED` or `PREPARING` at the nearby locations, the
+        one whose `LastUpdated` is closest to the plug-in time; if there is exactly one location with exactly one such
+        EVSE, that one. Connector: the only one, otherwise the first that is not `CHADEMO`.
+
+        **What nx-charge does with the result:**
+        | result | plug-in (automatic) | app start | app location screen |
+        |---|---|---|---|
+        | an EVSE in `BLOCKED` / `PREPARING` | becomes a start candidate | start continues to `sendCommand` | EVSE shown |
+        | EVSE in `AVAILABLE` / `CHARGING` | ignored | rejected: `start_step_2__station_in_invalid_status` | EVSE shown |
+        | EVSE in any other status | ignored | rejected: `start_step_2__station_in_invalid_status` | EVSE hidden |
+        | no candidate anywhere nearby | retried up to 5 times with a wider radius, then `start_step_2__failed_to_get_closest_locations` → car state `error`, nothing sent to Cloudwise | — | `Location has no stations with valid statuses` if no EVSE is shown |
+        | requested EVSE / connector missing | — | rejected: `start_step_2__station_not_found` / `start_step_2__connector_not_found` | — |
+        | `ErrorCode > 0` or network error | the whole search attempt fails and is retried as above | retried, then the start fails | the API answers with an error |
+
+        ### Response fields used
+        `Location.Location` (`Id`, `Name`, `Address`, `Country`, `Latitude`, `Longitude`, `Images`, `OperatorName`,
+        `OwnerPartyId`), `Location.Evses[]` (`Uid`, `EvseId`, `Status`, `FloorLevel`, `PhysicalReference`,
+        `LastUpdated`, `Connectors[]` incl. `PricePerKwh`, `ConnectionFee`, `ParkingFee`, `TariffDetails`).
       requestBody:
         required: true
         content:
@@ -181,22 +353,67 @@ paths:
       operationId: sendCommand
       summary: Start or stop a charging session
       description: |
-        Sends an OCPI remote command to a charger.
+        Sends an OCPI remote command to a charger. The response `CommandId` of `START_SESSION` is the session id used by
+        every later call (`getCommandStatus.commandId`, `STOP_SESSION.commandId`, `Cdr.SessionId`).
 
-        **START_SESSION** — `commandId` is omitted; the response `CommandId` becomes the session id for the rest of
-        the flow (`getCommandStatus.commandId`, `STOP_SESSION.commandId`, `Cdr.SessionId`). A response without
-        `CommandId` is a failure. Client timeout 180 s, 3 retries (3–10 s random delay).
-        If anything fails after a successful start, nx-charge immediately sends `STOP_SESSION`.
+        ### Preconditions
+        **START_SESSION**
+        - A valid `FirebaseToken`.
+        - The car is physically plugged into the target EVSE, and the EVSE's **live** status (from `getLocationDetails`,
+          not the catalog) is `BLOCKED` or `PREPARING` — the charger is occupied and waiting for authorization.
+        - `evseUid` and `connectorId` come from that same live response.
+        - The car's credit balance is above `credit_balance_threshold`.
+        - Automatic start only: the car's unit has the feature `plug_and_charge` (checked when the car's state document
+          first appears and on service boot).
+        - `commandId` is **not** sent.
 
-        **STOP_SESSION** — `commandId` is the session id. Sent when the session is no longer `ACTIVE`, the car's
-        credit runs out, monitoring fails, or `POST /stop_session` is called. Client timeout 30 s, 3 retries.
-        The response body is not used beyond the `ErrorCode` check.
+        **STOP_SESSION**
+        - A valid `FirebaseToken`.
+        - A session id returned by an earlier `START_SESSION`, sent as `commandId`.
+        - The session exists in Firestore `nx-charge-sessions` (otherwise nx-charge stops with
+          `stop_step_1__session_not_found` and sends nothing).
+        - The same `evseUid` / `connectorId` / `LocationId` that were used for the start.
+        - The session does **not** have to be `ACTIVE` at Cloudwise: nx-charge also sends `STOP_SESSION` after Cloudwise
+          already reports the session as finished.
 
-        **Values nx-charge sends today**
+        ### Practical usage
+        **START_SESSION — when:** right after the EVSE match on plug-in, or when the app asks to start.
+        **Why:** authorize the charger to deliver energy under the Akeyless account. Client timeout 180 s, up to 3
+        attempts, 3–10 s apart.
+
+        | result | handling |
+        |---|---|
+        | `ErrorCode 0` with `CommandId` | `nx-charge-sessions/{CommandId}` created with `status: started`; car state → `charging` with `session_id`, which starts monitoring (`getCommandStatus`) |
+        | `ErrorCode 0` without `CommandId` | treated as failure (retried) |
+        | `ErrorCode 1015` — `OCPI_ERROR_CPO_DECLINED` | the operator refused; retried, then the start fails |
+        | `ErrorCode 1000` — `The charger is not available` | retried, then the start fails |
+        | `ErrorCode 1003` — `timeout in connecting the plug` | retried, then the start fails |
+        | `ErrorCode 401` | token expired; retried, then the start fails |
+        | network error / timeout | retried, then the start fails (a timed-out start may still have been accepted — see *Known issues*) |
+        | all attempts failed | `start_step_4__failed_to_send_send_start_session_command`; car state → `error`; no session created |
+        | started, but saving to Firestore failed | `STOP_SESSION` is sent immediately and the session ends as `error` |
+
+        **STOP_SESSION — when:**
+        - 10 s after `getCommandStatus` stops reporting `ACTIVE` (skipped if the session is already `completed`);
+        - the car's credit cannot cover `credit_balance_threshold` + running cost;
+        - monitoring failed after its retries;
+        - manual stop from the app (`POST /api/charge/sessions/stop`, the car's latest `started` session);
+        - a failure right after a successful start;
+        - a new plug-in event while the car has an active session.
+
+        **Why:** close the session at Cloudwise so that it stops charging and produces a final CDR. Client timeout
+        30 s, up to 3 attempts, 3–10 s apart. Only the `ErrorCode` check is used from the response.
+
+        | result | handling |
+        |---|---|
+        | `ErrorCode 0` | running `Cost` charged from the car's credits → session `paid` (or `completed` / `error` if charging failed); car state gets the same status and `session_id` is cleared; 20 s later `getCommandStatus` is called once for the final CDR |
+        | all attempts failed | `stop_step_2__failed_to_stop_session_command` is logged and the stop flow ends there: the session stays `started`, is not charged, and monitoring is already off |
+
+        ### Values nx-charge sends today
         | field | START_SESSION | STOP_SESSION |
         |---|---|---|
-        | `LocationId` | raw Cloudwise location `Id` | location id stored on the session; for API-started sessions this is the composite id `{Id}-{PartyId}-{Country}` |
-        | `PartyID` | location party (auto start); **omitted** on API start | **omitted** |
+        | `LocationId` | raw Cloudwise location `Id` | location id stored on the session; for app-started sessions this is the composite id `{Id}-{PartyId}-{Country}` |
+        | `PartyID` | location party (automatic start); **omitted** on app start | **omitted** |
         | `CountryCode` | always `IL` | always `IL` |
         | `evseUid` / `connectorId` | chosen EVSE `Uid` / connector `Id` | same values as the start |
         | `ignoreDistanceCheck` | always `false` | always `false` |
@@ -248,6 +465,27 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SendCommandResponse"
+              examples:
+                started:
+                  summary: Started
+                  value:
+                    ErrorCode: 0
+                    ErrorMessage: ""
+                    ErrorProvider: 0
+                    Count: 1
+                    RequestID: req-120
+                    ServerTime: "2026-10-21T08:02:11.000Z"
+                    CommandId: "8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f"
+                declined:
+                  summary: Declined by the operator (seen in production)
+                  value:
+                    ErrorCode: 1015
+                    StatusCode: 200
+                    ErrorMessage: OCPI_ERROR_CPO_DECLINED
+                    ErrorProvider: 0
+                    Count: 0
+                    RequestID: req-121
+                    ServerTime: "2026-10-21T08:02:11.000Z"
 
   /getCommandStatus:
     post:
@@ -255,13 +493,37 @@ paths:
       operationId: getCommandStatus
       summary: Progress / final state of a charging session
       description: |
-        **Called by nx-charge**:
-        - Every 30 s for each active session (4 retries, 10–20 s random delay). Updates the session's kWh, cost and
-          charging time, and checks the car's credit balance against the running `Cost`.
-        - Once, 20 s after `STOP_SESSION`, to collect the final numbers and the `Cdr` (if returned the car is billed from it).
+        Returns the state of a session (`CommandStatus`), its running kWh, cost and charging time, and the CDR once the
+        session is closed.
 
-        **Interpretation**: the session is treated as running while `CommandStatus` contains `ACTIVE`; anything else
-        ends it. After stop, the final data is stored only when `CommandStatus` contains `COMPLETED`.
+        ### Preconditions
+        - A valid `FirebaseToken`.
+        - A session id returned by `START_SESSION`, sent as `commandId`.
+        - The session belongs to this account (`assetId`, `BleId`, `deviceId` from config).
+
+        ### Practical usage
+        **When:**
+        - every 30 s for each active session, from the moment the car state becomes `charging` (also resumed after a
+          restart); up to 4 attempts per poll, 10–20 s apart;
+        - once, 20 s after `STOP_SESSION`, to collect the final numbers and the CDR.
+
+        **Why:** follow the session's progress, stop it when the credit runs out, and detect that it ended at the
+        charger (Cloudwise is the only source for that — the car's plug-out event is ignored).
+
+        **While monitoring:**
+        | result | handling |
+        |---|---|
+        | `CommandStatus` contains `ACTIVE` | `kwh`, `cost`, `charging_time_in_seconds` saved on the session; if balance > `credit_balance_threshold` + `Cost` → next poll in 30 s, otherwise `STOP_SESSION` |
+        | `COMPLETED`, `FAILED` or anything else | numbers saved; monitoring ends; 10 s later `STOP_SESSION` (unless the session is already `completed`) |
+        | `ErrorCode > 0` (e.g. `401`) or network error, after 4 attempts | `STOP_SESSION` with status `error`, message `active_step_1__failed_to_get_session_details` |
+
+        **After the stop:**
+        | result | handling |
+        |---|---|
+        | `CommandStatus` contains `COMPLETED`, with `Cdr` | final `cost`, `kwh`, `charging_time_in_seconds` saved; the car is charged `Cdr.TotalCost` minus what was charged at stop; CDR stored in `nx-charge-cdrs/{Cdr.Id}` and linked to the session (`cdr_id`) |
+        | `COMPLETED` without `Cdr` | final numbers saved; the CDR is collected later by `getUserCdrs` |
+        | not `COMPLETED`, or an error | nothing saved; the CDR is collected later by `getUserCdrs` |
+
         `Kwh`, `Cost` and `ChargingTimeInSeconds` arrive as **strings** and are parsed as numbers (invalid → 0).
       requestBody:
         required: true
@@ -362,14 +624,35 @@ paths:
       operationId: getUserCdrs
       summary: All CDRs of the account
       description: |
-        **Called by nx-charge**: every 5 minutes (`task__collect_charge_cdrs`) with the fixed values shown in the
-        example. Each finished session that has no CDR yet is matched to a CDR by `Cdr.SessionId == session id`;
-        the car is then billed by `TotalCost` (minus what was already billed from `getCommandStatus`), and the CDR is
-        stored in Firestore `nx-charge-cdrs` under its `Id`.
+        Returns every CDR (final billing record) of the Akeyless account.
 
-        **Response fields used**: `Items[]` → `Id`, `SessionId`, `OcpPartyId`, `StartDateTime`, `EndDateTime`,
-        `LastUpdated`, `Currency`, `TotalCost`, `TotalCostWithVat`, `TotalFixCost`, `TotalFixCostWithVat`,
-        `TotalEnergy`, `TotalTime`, `TotalParkingTime`, `AvgKwhPrice`, `Duration`.
+        ### Preconditions
+        - A valid `FirebaseToken`.
+        - `assetId` of the account. No session id is needed — the call returns the whole account history.
+        - For a CDR to be used, its session must already be stopped in nx-charge (status other than `started`) and not
+          yet linked to a CDR.
+
+        ### Practical usage
+        **When:** every 5 minutes (only on the instance with `run_tasks=true`), with the fixed values shown in the
+        example.
+
+        **Why:** safety net for final billing. A session normally receives its CDR from `getCommandStatus` 20 s after
+        the stop; when Cloudwise did not have it yet, this job finds it later. The CDR is the source of truth for what
+        the car pays.
+
+        **What nx-charge does with the result:**
+        | result | handling |
+        |---|---|
+        | a CDR whose `SessionId` matches a stopped session without `cdr_id` | the car is charged `TotalCost` (minus what was charged at stop if the session is already `paid`); the CDR is stored in `nx-charge-cdrs/{Id}` with `paid` and the session gets `cdr_id` |
+        | that CDR is already stored with `paid: true` | skipped |
+        | no CDR for a stopped session yet | nothing; checked again on the next run (no time limit) |
+        | sessions still `started` | ignored |
+        | `ErrorCode > 0` (e.g. `401`) or network error / timeout | job run fails and is logged; next run in 5 min (timeouts are the most common failure, since the whole history is fetched) |
+
+        ### Response fields used
+        `Items[]` → `Id`, `SessionId`, `OcpPartyId`, `StartDateTime`, `EndDateTime`, `LastUpdated`, `Currency`,
+        `TotalCost`, `TotalCostWithVat`, `TotalFixCost`, `TotalFixCostWithVat`, `TotalEnergy`, `TotalTime`,
+        `TotalParkingTime`, `AvgKwhPrice`, `Duration`.
       requestBody:
         required: true
         content:
@@ -444,8 +727,10 @@ components:
       required: [ErrorCode]
       properties:
         ErrorCode:
+          $ref: "#/components/schemas/CloudwiseErrorCode"
+        StatusCode:
           type: integer
-          description: 0 = success. Any value > 0 is treated by nx-charge as a failure.
+          description: Present on error responses; `200` in every error seen in production.
         ErrorMessage:
           type: string
           nullable: true
@@ -513,7 +798,7 @@ components:
               description: Location id. See the table in the operation description for the exact value per case.
             PartyID:
               type: string
-              description: Location party id. Sent only on auto START_SESSION; omitted on API start and on STOP_SESSION.
+              description: Location party id. Sent only on automatic START_SESSION; omitted on app start and on STOP_SESSION.
             CountryCode:
               type: string
               description: Always `IL`.
@@ -662,31 +947,156 @@ components:
                 $ref: "#/components/schemas/CdrItem"
 
     # ---------------- enums ----------------
+    CloudwiseErrorCode:
+      type: integer
+      description: |
+        `0` = success, anything above `0` = failure. Cloudwise does not publish a full list; these are the codes it
+        returned to nx-charge in production (2026-09-21 → 2026-10-21):
+        | code | `ErrorMessage` | returned by | meaning / handling |
+        |---|---|---|---|
+        | `0` | — | all | success |
+        | `401` | `Authentication error` | `getLocations`, `getUserCdrs` | `FirebaseToken` expired or invalid — log in again |
+        | `1000` | `The charger is not available` | `sendCommand` START_SESSION | the charger cannot accept a start right now |
+        | `1003` | `timeout in connecting the plug` | `sendCommand` START_SESSION | the charger did not detect a connected plug in time |
+        | `1015` | `OCPI_ERROR_CPO_DECLINED` | `sendCommand` START_SESSION | the charge point operator refused the remote start (most common start error) |
+      example: 0
     SessionCommand:
       type: string
+      description: |
+        | value | meaning |
+        |---|---|
+        | `START_SESSION` | authorize the EVSE to start charging; returns `CommandId` (session id) |
+        | `STOP_SESSION` | end the session identified by `commandId` |
       enum: [START_SESSION, STOP_SESSION]
     CommandStatus:
       type: string
-      description: nx-charge checks with `includes`, so `ACTIVE` = running, `COMPLETED` = finished, anything else = finished.
+      description: |
+        State of a session, returned by `getCommandStatus`. nx-charge checks with `includes`.
+        | value | meaning | nx-charge handling |
+        |---|---|---|
+        | `ACTIVE` | session running at the charger | keep monitoring every 30 s |
+        | `COMPLETED` | session ended normally | stop flow; after the stop, final numbers and CDR are saved |
+        | `FAILED` | session failed at the charger / operator | stop flow; no final numbers saved |
       enum: [ACTIVE, COMPLETED, FAILED]
     EvseStatus:
       type: string
       description: |
-        OCPI EVSE status. A charger with a car plugged in and waiting for a start command reports `BLOCKED` or
-        `PREPARING` — those are the only statuses nx-charge starts a session on.
-        The app shows only `AVAILABLE`, `PREPARING`, `BLOCKED`, `CHARGING`.
-      enum: [AVAILABLE, PREPARING, BLOCKED, CHARGING, INOPERATIVE, OUTOFORDER, UNKNOWN, PLANNED]
+        Status of an EVSE (charging point). Values follow OCPI 2.2.1, plus `PREPARING`, which Cloudwise passes through
+        from the charger.
+        | value | meaning | start candidate | shown in the app |
+        |---|---|---|---|
+        | `AVAILABLE` | free, no car connected | no | yes |
+        | `PREPARING` | a car is connected and the charger is preparing / waiting for authorization | **yes** | yes |
+        | `BLOCKED` | occupied and not charging — in practice: cable connected, waiting for authorization | **yes** | yes |
+        | `CHARGING` | a session is delivering energy | no | yes |
+        | `RESERVED` | reserved for another driver | no | no |
+        | `INOPERATIVE` | temporarily out of service | no | no |
+        | `OUTOFORDER` | broken | no | no |
+        | `PLANNED` | not yet in operation | no | no |
+        | `REMOVED` | decommissioned | no | no |
+        | `UNKNOWN` | status not reported by the operator | no | no |
+      enum: [AVAILABLE, PREPARING, BLOCKED, CHARGING, RESERVED, INOPERATIVE, OUTOFORDER, PLANNED, REMOVED, UNKNOWN]
     ConnectorFormat:
       type: string
-      description: "`CABLE` = cable attached to the charger; `SOCKET` = driver brings a cable."
+      description: |
+        | value | meaning |
+        |---|---|
+        | `CABLE` | a cable is attached to the charger (shown as "cable included") |
+        | `SOCKET` | the driver brings a cable |
       enum: [CABLE, SOCKET]
     ConnectorStandard:
       type: string
       description: |
-        OCPI connector standard. Values seen / handled by nx-charge: `IEC_62196_T2`, `IEC_62196_T2_COMBO`, `CHADEMO`,
-        `IEC_62196_T1_COMBO`, `DOMESTIC_A`, `DOMESTIC_C`. The app lists only `IEC_62196_T2` and `IEC_62196_T2_COMBO`;
-        auto start avoids `CHADEMO` when the EVSE has another connector.
-      example: IEC_62196_T2
+        Plug type (OCPI 2.2.1 `ConnectorType`). The relevant ones in Israel:
+        | value | plug | nx-charge handling |
+        |---|---|---|
+        | `IEC_62196_T2` | Type 2 (AC) | shown in the app; can be started |
+        | `IEC_62196_T2_COMBO` | CCS2 (DC) | shown in the app; can be started |
+        | `CHADEMO` | CHAdeMO (DC) | hidden; on plug-in another connector of the same EVSE is preferred |
+        | `IEC_62196_T1` / `IEC_62196_T1_COMBO` | Type 1 / CCS1 | hidden |
+        | `GBT_AC` / `GBT_DC` | Chinese GB/T | hidden |
+        | `DOMESTIC_*`, `IEC_60309_*`, `NEMA_*` | household / industrial sockets | hidden |
+        | others | rare / regional | hidden |
+      enum:
+        - CHADEMO
+        - CHAOJI
+        - DOMESTIC_A
+        - DOMESTIC_B
+        - DOMESTIC_C
+        - DOMESTIC_D
+        - DOMESTIC_E
+        - DOMESTIC_F
+        - DOMESTIC_G
+        - DOMESTIC_H
+        - DOMESTIC_I
+        - DOMESTIC_J
+        - DOMESTIC_K
+        - DOMESTIC_L
+        - DOMESTIC_M
+        - DOMESTIC_N
+        - DOMESTIC_O
+        - GBT_AC
+        - GBT_DC
+        - IEC_60309_2_single_16
+        - IEC_60309_2_three_16
+        - IEC_60309_2_three_32
+        - IEC_60309_2_three_64
+        - IEC_62196_T1
+        - IEC_62196_T1_COMBO
+        - IEC_62196_T2
+        - IEC_62196_T2_COMBO
+        - IEC_62196_T3A
+        - IEC_62196_T3C
+        - NEMA_5_20
+        - NEMA_6_30
+        - NEMA_6_50
+        - NEMA_10_30
+        - NEMA_10_50
+        - NEMA_14_30
+        - NEMA_14_50
+        - PANTOGRAPH_BOTTOM_UP
+        - PANTOGRAPH_TOP_DOWN
+        - TESLA_R
+        - TESLA_S
+    PowerType:
+      type: string
+      description: |
+        Electrical supply of a connector (OCPI 2.2.1).
+        | value | meaning |
+        |---|---|
+        | `AC_1_PHASE` | AC, single phase |
+        | `AC_2_PHASE` | AC, two phases |
+        | `AC_2_PHASE_SPLIT` | AC, split phase |
+        | `AC_3_PHASE` | AC, three phases (typical Type 2 in Israel) |
+        | `DC` | direct current (fast charging) |
+      enum: [AC_1_PHASE, AC_2_PHASE, AC_2_PHASE_SPLIT, AC_3_PHASE, DC]
+    DayOfWeek:
+      type: string
+      description: Day a tariff item applies to (OCPI 2.2.1).
+      enum: [MONDAY, TUESDAY, WEDNESDAY, THURSDAY, FRIDAY, SATURDAY, SUNDAY]
+    AuthMethod:
+      type: string
+      nullable: true
+      description: |
+        How the CDR's session was authorized (OCPI 2.2.1).
+        | value | meaning |
+        |---|---|
+        | `AUTH_REQUEST` | authorized by a real-time request to the eMSP |
+        | `COMMAND` | started by a remote command (`sendCommand`) |
+        | `WHITELIST` | authorized locally from a whitelist |
+      enum: [AUTH_REQUEST, COMMAND, WHITELIST, null]
+    TokenType:
+      type: string
+      nullable: true
+      description: |
+        Type of the token on the CDR (OCPI 2.2.1).
+        | value | meaning |
+        |---|---|
+        | `AD_HOC_USER` | one-time user (e.g. paid at the charger) |
+        | `APP_USER` | user of a mobile app |
+        | `RFID` | RFID card |
+        | `OTHER` | anything else |
+      enum: [AD_HOC_USER, APP_USER, RFID, OTHER, null]
 
     # ---------------- location model ----------------
     Location:
@@ -727,6 +1137,7 @@ components:
           type: string
         ParkingType:
           type: string
+          description: "OCPI parking type, may be empty. Known values: `ALONG_MOTORWAY`, `PARKING_GARAGE`, `PARKING_LOT`, `ON_DRIVEWAY`, `ON_STREET`, `UNDERGROUND_GARAGE`. Not used by nx-charge."
         Images:
           type: string
           nullable: true
@@ -839,8 +1250,7 @@ components:
         Format:
           $ref: "#/components/schemas/ConnectorFormat"
         PowerType:
-          type: string
-          example: AC_3_PHASE
+          $ref: "#/components/schemas/PowerType"
         MaxVoltage:
           type: number
         MaxAmperage:
@@ -906,6 +1316,7 @@ components:
             properties:
               Type:
                 type: integer
+                description: Numeric price-component code. Cloudwise does not document the mapping; nx-charge stores it as is.
               Price:
                 type: number
               Vat:
@@ -919,7 +1330,7 @@ components:
         DaysOfWeek:
           type: array
           items:
-            type: string
+            $ref: "#/components/schemas/DayOfWeek"
 
     # ---------------- CDR ----------------
     CdrItem:
@@ -944,8 +1355,7 @@ components:
           type: string
           description: Equals the `CommandId` returned by START_SESSION. The join key between sessions and CDRs.
         AuthMethod:
-          type: string
-          nullable: true
+          $ref: "#/components/schemas/AuthMethod"
         AuthorizationReference:
           type: string
           nullable: true
@@ -1002,8 +1412,7 @@ components:
           type: string
           nullable: true
         CdrTokenType:
-          type: string
-          nullable: true
+          $ref: "#/components/schemas/TokenType"
         CdrTokenContractId:
           type: string
           nullable: true
