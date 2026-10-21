@@ -130,13 +130,13 @@ export const service__get_location_details: Service = async (req, res) => {
 export const service__stop_session: Service = async (req, res) => {
     const { car_number } = req.body;
     logger.log(`🦋 Stopping session for car: "${car_number}"`);
-    const sessions: ChargingSession[] = cache_manager.getArrayData("nx-charge-sessions");
-    const filter_sessions = sessions.filter((session) => session.car_number === car_number && session.status === "started");
-    if (filter_sessions.length === 0) {
-        throw new Error("No session found");
-    }
-    const session = filter_sessions.sort((a, b) => b.started.toDate().getTime() - a.started.toDate().getTime())[0];
     try {
+        const sessions: ChargingSession[] = cache_manager.getArrayData("nx-charge-sessions");
+        const filter_sessions = sessions.filter((session) => session.car_number === car_number && session.status === "started");
+        if (filter_sessions.length === 0) {
+            throw new Error("No session found");
+        }
+        const session = filter_sessions.sort((a, b) => b.started.toDate().getTime() - a.started.toDate().getTime())[0];
         await stop_session(session.id!, { message: "API call" });
         res.json(json_ok({ message: "Session stopped" }));
     } catch (error) {

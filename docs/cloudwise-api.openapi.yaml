@@ -69,7 +69,8 @@ info:
        is cleared.
     8. **Final billing.** 20 s after the stop, nx-charge asks Cloudwise once more for the final status and the CDR. If a
        CDR is returned, the car is charged the difference between the CDR's `TotalCost` and what was already charged,
-       and the CDR is stored. If not, the 5-minute CDR job picks it up later.
+       and the CDR is stored. If not, the 5-minute CDR job is meant to pick it up later (currently it never matches —
+       see *Known issues*).
 
     **Alternative entry — start from the app** (`POST /api/charge/sessions/start`): the user picks location, EVSE and
     connector. Same credit check; nx-charge verifies the live EVSE status is `BLOCKED` / `PREPARING` and sends the
@@ -140,9 +141,9 @@ info:
     - **App-started sessions**: `STOP_SESSION` sends the composite location id `{Id}-{PartyId}-{Country}` and no
       `PartyID`; `START_SESSION` from the app sends no `PartyID`.
     - **A failed remote stop leaves the session `started`** in Firestore: it is not charged and the CDR job skips it.
-    - **CDR job write order**: when a CDR is found only by the 5-minute job, the session and CDR documents are added to a
-      Firestore batch after the batch was committed, so they are not saved and the session can be charged again on the
-      next run. Not seen in the last 30 days of logs (CDRs arrived through the stop flow).
+    - **The CDR job never matches a CDR**: CDRs from `getUserCdrs` are matched to sessions by `session_id`, but the CDR
+      parser does not copy `SessionId`, so no match is ever found. Final billing happens only through the stop flow
+      (`getCommandStatus` 20 s after the stop); a session whose CDR was not ready then is not reconciled.
     - **Full history on every run**: `getLocations` and `getUserCdrs` fetch everything every 3 / 5 minutes.
 
     # 9. Endpoint map
@@ -639,6 +640,9 @@ paths:
         **Why:** safety net for final billing. A session normally receives its CDR from `getCommandStatus` 20 s after
         the stop; when Cloudwise did not have it yet, this job finds it later. The CDR is the source of truth for what
         the car pays.
+
+        **Current state:** the job never finds a match today, because nx-charge's CDR parser does not copy `SessionId`
+        (see *Known issues*). The table below is the designed behavior.
 
         **What nx-charge does with the result:**
         | result | handling |

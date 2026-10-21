@@ -68,33 +68,27 @@ export const task__collect_charge_cdrs = async () => {
     const debug_result: any[] = [];
     if (cached_sessions.length) {
         const batch = db.batch();
-        cached_sessions.forEach(async (session) => {
-            if (!session.id) {
-                return;
-            }
+        for (const session of cached_sessions) {
             const session_id = session.id;
             const cdr = parsed_cdrs.find((cdr) => cdr.session_id === session_id);
-            if (cdr) {
-                const cdr_id = cdr.id;
-                if (cdr_id) {
-                    const current_cdr = cache_manager.getArrayData("nx-charge-cdrs").find((cdr) => cdr.id === cdr_id);
-                    if (current_cdr?.paid) {
-                        return;
-                    }
-                    const is_charged = await charge_cdr(session as ChargingSession, cdr);
-                    delete (session as any).id;
-                    delete cdr.id;
-                    batch.set(db.collection("nx-charge-sessions").doc(session_id!), { cdr_id: cdr_id }, { merge: true });
-                    batch.set(db.collection("nx-charge-cdrs").doc(cdr_id), {
-                        ...cdr,
-                        car_number: session.car_number,
-                        nx_updated: session.updated,
-                        paid: is_charged,
-                    });
-                    debug_result.push({ session_id, cdr_id });
-                }
+            if (!cdr?.id) {
+                continue;
             }
-        });
+            const { id: cdr_id, ...cdr_data } = cdr;
+            const current_cdr = cache_manager.getArrayData("nx-charge-cdrs").find((cdr) => cdr.id === cdr_id);
+            if (current_cdr?.paid) {
+                continue;
+            }
+            const is_charged = await charge_cdr(session, cdr);
+            batch.set(db.collection("nx-charge-sessions").doc(session_id), { cdr_id }, { merge: true });
+            batch.set(db.collection("nx-charge-cdrs").doc(cdr_id), {
+                ...cdr_data,
+                car_number: session.car_number,
+                nx_updated: session.updated,
+                paid: is_charged,
+            });
+            debug_result.push({ session_id, cdr_id });
+        }
         await batch.commit();
         if (task_collect_cdr_debug) {
             logger.log(`✔️ updated ${debug_result.length} sessions CDRs`);
